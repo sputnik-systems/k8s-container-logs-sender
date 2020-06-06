@@ -1,3 +1,5 @@
 .dockerignore
-DOckerfile
-.git*
+Dockerfile
+main
+kubeconfig
+*.log

@@ -4,9 +4,15 @@ ENV GOOS=linux
 ENV GOARCH=amd64 
 WORKDIR /build
 COPY . .
+RUN apt update \
+    && apt install -y git
 RUN go get -v ./...
-RUN go build -a -installsuffix cgo -o k8s-send-container-logs-to-tg
+RUN export GIT_TAG=`git describe --tags HEAD` GIT_SHA_SHORT=`git rev-parse --short HEAD` \
+    && go build -v -a -installsuffix cgo \
+                -o k8s-container-logs-sender \
+                -ldflags "-X main.version=${GIT_TAG} -X main.commitID=${GIT_SHA_SHORT}" .
 
 FROM scratch
-COPY --from=build /build/k8s-send-container-logs-to-tg /usr/local/bin/k8s-send-container-logs-to-tg
-ENTRYPOINT ["/usr/local/bin/k8s-send-container-logs-to-tg"]
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /build/k8s-container-logs-sender /usr/local/bin/k8s-container-logs-sender
+ENTRYPOINT ["/usr/local/bin/k8s-container-logs-sender"]

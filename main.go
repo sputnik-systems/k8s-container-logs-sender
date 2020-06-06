@@ -23,7 +23,10 @@ import (
 	"bytes"
 	"context"
 	"io"
-	// "os"
+	"os"
+	// "errors"
+	"regexp"
+	"text/tabwriter"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -42,16 +45,19 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	// "k8s.io/client-go/rest"
 )
 
 var (
-	delay      int64
-	chatID     int64
-	namespace  string
-	pods       []string
-	containers []string
+	delay                 int64
+	chatID                int64
+	tailLines             *int64
+	namespace             string
+	podNamePatterns       []string
+	containerNamePatterns []string
+
+	version, commitID string
 
 	clientset *kubernetes.Clientset
 )
@@ -166,28 +172,44 @@ func (c *Controller) runWorker() {
 }
 
 func main() {
-	// var kubeconfig string
-	// var master string
+	var config *rest.Config
+	var kubeconfig string
+	var err error
+	var versionFlag bool
 
-	// flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
-	// flag.StringVar(&master, "master", "", "master url")
+	pflag.BoolVar(&versionFlag, "version", false, "return application version")
 	pflag.Int64Var(&delay, "delay", 60, "delay between localtime and time in pod status field")
 	pflag.Int64Var(&chatID, "chat-id", 0, "telegram chat id")
+	pflag.StringVar(&kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "absolute path to the kubeconfig file")
 	pflag.StringVar(&namespace, "namespace", "default", "monitored namespace")
-	pflag.StringArrayVar(&pods, "pod", []string{}, "pod names which will be monitored")
-	pflag.StringArrayVar(&containers, "container", []string{}, "container names which will be monitored")
+	pflag.StringArrayVar(&podNamePatterns, "pod-name-pattern", []string{}, "pod name pattern(may be regexp), which will be monitored")
+	pflag.StringArrayVar(&containerNamePatterns, "container-name-pattern", []string{}, "container name pattern(may be regexp), which will be monitored")
+
+	tailLines = pflag.Int64("tail", 100000, "tail last num lines")
+
 	pflag.Parse()
 
+	if versionFlag {
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		if version != "" {
+			fmt.Fprintf(w, "version:\t%s\n", version)
+		}
+		fmt.Fprintf(w, "git commit:\t%s\n", commitID)
+		w.Flush()
+		os.Exit(0)
+	}
+
 	// creates the connection
-	// config, err := clientcmd.BuildConfigFromFlags(master, kubeconfig)
-	config, err := clientcmd.BuildConfigFromFlags("", "./kubeconfig")
-	// config, err := rest.InClusterConfig()
+	if len(kubeconfig) > 0 {
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+	} else {
+		config, err = rest.InClusterConfig()
+	}
 	if err != nil {
 		klog.Fatal(err)
 	}
 
 	// creates the clientset
-	// clientset, err := kubernetes.NewForConfig(config)
 	clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
 		klog.Fatal(err)
@@ -195,7 +217,7 @@ func main() {
 
 	// create the pod watcher
 	// podListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", v1.NamespaceDefault, fields.Everything())
-	podListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", "staging", fields.Everything())
+	podListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", namespace, fields.Everything())
 
 	// create the workqueue
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
@@ -229,17 +251,6 @@ func main() {
 
 	controller := NewController(queue, indexer, informer)
 
-	// We can now warm up the cache for initial synchronization.
-	// Let's suppose that we knew about a pod "mypod" on our last run, therefore add it to the cache.
-	// If this pod is not there anymore, the controller will be notified about the removal after the
-	// cache has synchronized.
-	// indexer.Add(&v1.Pod{
-	// 	ObjectMeta: meta_v1.ObjectMeta{
-	// 		Name:      "mypod",
-	// 		Namespace: v1.NamespaceDefault,
-	// 	},
-	// })
-
 	// Now let's start the controller
 	stop := make(chan struct{})
 	defer close(stop)
@@ -249,36 +260,35 @@ func main() {
 	select {}
 }
 
-// func sendPodLogs(pod *v1.Pod, containerName string) error {
 func sendContainerLogs(pod *v1.Pod, containerName string) error {
 	podLogOpts := v1.PodLogOptions{
 		Container: containerName,
-		// Previous:  true,
+		TailLines: tailLines,
 	}
 
 	req := clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &podLogOpts)
 	podLogs, err := req.Stream(context.TODO())
 	if err != nil {
-		return err
+		return fmt.Errorf("[sendContainerLogs] failed create stream: %s", err)
 	}
 	defer podLogs.Close()
 
 	buf := new(bytes.Buffer)
 	_, err = io.Copy(buf, podLogs)
 	if err != nil {
-		return err
+		return fmt.Errorf("[sendContainerLogs] failed copy pod logs to buffer: %s", err)
 	}
-	// str := buf.String()
-	// fmt.Println(str)
-	err = sendLogsToTelegram(chatID, buf)
+
+	prefix := fmt.Sprintf("%s_%s", pod.GetName(), containerName)
+
+	err = sendLogsToTelegram(chatID, buf, prefix)
 	if err != nil {
-		fmt.Println(err)
+		return fmt.Errorf("[sendContainerLogs] failed send message: %s", err)
 	}
 
 	return nil
 }
 
-// ПЕРЕПИСАТЬ!!!
 func isShouldCheck(name string, list []string) bool {
 	if len(list) == 0 {
 		return true
@@ -294,7 +304,17 @@ func isShouldCheck(name string, list []string) bool {
 }
 
 func isPodShouldCheck(podName string, podList []string) bool {
-	return isShouldCheck(podName, podList)
+	if len(podList) == 0 {
+		return true
+	} else {
+		for _, pod := range podList {
+			if matched, _ := regexp.MatchString(pod, podName); matched {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func isContainerShouldCheck(containerName string, containerList []string) bool {
@@ -319,82 +339,27 @@ func isContainerLogShouldSended(containerStatus v1.ContainerStatus) bool {
 
 func processContainers(pod *v1.Pod) {
 	for _, containerStatus := range pod.Status.ContainerStatuses {
-		if isContainerShouldCheck(containerStatus.Name, containers) {
+		if isContainerShouldCheck(containerStatus.Name, containerNamePatterns) {
 			if isContainerLogShouldSended(containerStatus) {
 				klog.Infof("Send logs from pod: %s, container: %s", pod.GetName(), containerStatus.Name)
 
-				sendContainerLogs(pod, containerStatus.Name)
+				err := sendContainerLogs(pod, containerStatus.Name)
+				if err != nil {
+					klog.Errorf("[processContainers] failed sed contianer logs: %s", err)
+				}
 			}
 		}
 	}
 }
 
 func processPod(obj interface{}) {
-	// get pod status
 	pod := obj.(*v1.Pod)
 
 	podName := pod.GetName()
 
 	klog.Infof("Event from pod: %s", podName)
 
-	if isPodShouldCheck(podName, pods) {
+	if isPodShouldCheck(podName, podNamePatterns) {
 		processContainers(pod)
 	}
 }
-
-// func sendLogsToTelegram(chatID int64, logs *bytes.Buffer) error {
-// 	token := os.Getenv("TG_BOT_TOKEN")
-//
-// 	bot, err := tgbotapi.NewBotAPI(token)
-// 	if err != nil {
-// 		return err
-// 	}
-//
-// 	logFileName := fmt.Sprintf("%d.log", time.Now().Unix())
-// 	logFile, err := os.Create(fmt.Sprintf(logFileName))
-// 	if err != nil {
-// 		return err
-// 	}
-//
-// 	var logsBytes []byte
-//
-// 	// n, err := logs.Read(logsBytes)
-// 	// if err != nil {
-// 	// 	return err
-// 	// }
-//
-// 	logsBytes = logs.Next(logs.Len())
-// 	// fmt.Println(logsBytes)
-//
-// 	// fmt.Println(n)
-//
-// 	// for {
-// 	// 	n, err := logFile.Read(logsBytes)
-// 	// 	if err != nil {
-// 	// 		return err
-// 	// 	}
-// 	// 	fmt.Println(n)
-//
-// 	// 	if n == 0 {
-// 	// 		break
-// 	// 	}
-// 	// }
-//
-// 	_, err = logFile.Write(logsBytes)
-// 	if err != nil {
-// 		return err
-// 	}
-//
-// 	logFile.Close()
-//
-// 	msg := tgbotapi.NewDocumentUpload(chatID, logFileName)
-//
-// 	_, err = bot.Send(msg)
-// 	if err != nil {
-// 		return err
-// 	}
-//
-// 	os.Remove(logFileName)
-//
-// 	return nil
-// }
